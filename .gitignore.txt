@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# File to QR runtime artifacts — never commit generated secrets/QRs
+file_to_qr_output/
+.file_to_qr_config.json
+
+# OS
+.DS_Store
+Thumbs.db
