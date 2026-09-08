@@ -437,7 +437,13 @@ def parse_qr_payload(raw: str) -> QRChunk | None:
 
 
 def read_qr_from_file(png_path: Path) -> QRChunk | None:
-    """Runs zbarimg on a PNG file and parses the result."""
+    """Runs zbarimg on a PNG file and parses the result.
+
+    If the image contains several QR codes, zbarimg separates them with a
+    newline in its --raw output — this must be handled per line (see
+    read_any_qr_from_file), otherwise everything after the first line ends
+    up glued onto the base64 "data" field of the first chunk.
+    """
     result = subprocess.run(
         ["zbarimg", "-q", "--raw", str(png_path)],
         capture_output=True,
@@ -445,10 +451,17 @@ def read_qr_from_file(png_path: Path) -> QRChunk | None:
     )
     if result.returncode != 0:
         return None
-    raw = result.stdout.decode("utf-8", errors="replace").strip()
-    if not raw:
+    raw_out = result.stdout.decode("utf-8", errors="replace").strip()
+    if not raw_out:
         return None
-    return parse_qr_payload(raw)
+    for line in raw_out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        chunk = parse_qr_payload(line)
+        if chunk is not None:
+            return chunk
+    return None
 
 
 def read_any_qr_from_file(image_path: Path) -> tuple[list[str], str]:
@@ -596,7 +609,7 @@ def render_ascii_frame(image_path: Path, width: int = 60,
     # Normalize into a single list of boxes to draw, regardless of which
     # call mode was used.
     box_list: list[tuple[tuple[int, int, int, int], bool]] = []
-    if boxes:
+    if boxes is not None:
         box_list = [b for b in boxes if b[0]]
     elif bbox:
         box_list = [(bbox, found)]
@@ -1280,13 +1293,16 @@ def _load_camera_progress() -> AssemblyState | None:
         return None
     try:
         data = json.loads(CAMERA_PROGRESS_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
+        state = AssemblyState(total=data["total"], filehash=data["filehash"])
+        for idx_str, chunk_data in data["chunks"].items():
+            idx = int(idx_str)
+            state.chunks[idx] = QRChunk(index=idx, total=state.total, filehash=state.filehash, data=chunk_data)
+        return state
+    except (json.JSONDecodeError, OSError, KeyError, ValueError, AttributeError):
+        # A malformed/foreign progress file (e.g. leftover from an older
+        # format, or manually edited) must not crash the whole program —
+        # just treat it as "no usable progress" and start fresh.
         return None
-    state = AssemblyState(total=data["total"], filehash=data["filehash"])
-    for idx_str, chunk_data in data["chunks"].items():
-        idx = int(idx_str)
-        state.chunks[idx] = QRChunk(index=idx, total=state.total, filehash=state.filehash, data=chunk_data)
-    return state
 
 
 def _clear_camera_progress():
@@ -1407,15 +1423,23 @@ def menu_decrypt_camera(config: Config):
         return
 
     _fx_flash_success("✓ All chunks assembled!")
-    _clear_camera_progress()
-    _finish_assembly(state, config)
+    _finish_assembly(state, config, on_success=_clear_camera_progress)
 
 
 # ---------------------------------------------------------------------------
 # Shared assembly finale (Modes 2 and 3): decoding + decryption + saving
 # ---------------------------------------------------------------------------
 
-def _finish_assembly(state: AssemblyState, config: Config):
+def _finish_assembly(state: AssemblyState, config: Config, on_success=None):
+    """Decodes, decrypts and saves the assembled file.
+
+    on_success, if given, is called only after the decrypted file has been
+    saved to disk — e.g. to clear Mode 3's on-disk camera-scan progress.
+    It must NOT be called before that point: if it ran up front and the
+    user then mistyped the password, the saved scan progress would be
+    wiped even though nothing was actually decrypted, forcing them to
+    re-scan every QR code from scratch.
+    """
     tmp_encrypted = TEMP_DIR / f"file_to_qr_assembled_{os.getpid()}.enc"
     tmp_decrypted = TEMP_DIR / f"file_to_qr_decrypted_{os.getpid()}.out"
     try:
@@ -1423,21 +1447,25 @@ def _finish_assembly(state: AssemblyState, config: Config):
             _err("Assembly cancelled.")
             return
 
-        password = getpass("Password to decrypt: ")
-        try:
-            # bright_cyan instead of the old bright_green is intentional: the
-            # same semantic code as in sub-mode headers (_C_ACCENT) — this
-            # way the "read/restore" operation is visually distinct from
-            # "create" (encryption, green) on 🔐, while staying in the same
-            # palette as the rest of the UI instead of a random separate color.
-            with console.status(f"[bold {_C_ACCENT}]🔓 Decrypting...[/bold {_C_ACCENT}]", spinner="bouncingBar"):
-                try:
-                    decrypt_file(tmp_encrypted, tmp_decrypted, password)
-                except CryptoError as e:
-                    _err(str(e))
-                    return
-        finally:
-            del password
+        while True:
+            password = getpass("Password to decrypt: ")
+            try:
+                # bright_cyan instead of the old bright_green is intentional: the
+                # same semantic code as in sub-mode headers (_C_ACCENT) — this
+                # way the "read/restore" operation is visually distinct from
+                # "create" (encryption, green) on 🔐, while staying in the same
+                # palette as the rest of the UI instead of a random separate color.
+                with console.status(f"[bold {_C_ACCENT}]🔓 Decrypting...[/bold {_C_ACCENT}]", spinner="bouncingBar"):
+                    try:
+                        decrypt_file(tmp_encrypted, tmp_decrypted, password)
+                    except CryptoError as e:
+                        _err(str(e))
+                        if not Confirm.ask("Try the password again?", default=True):
+                            return
+                        continue
+            finally:
+                del password
+            break
 
         default_out = str(DEFAULT_DOWNLOADS) if DEFAULT_DOWNLOADS.exists() else str(Path.home())
         dest_str = Prompt.ask("Where to save the decrypted file (folder)", default=default_out)
@@ -1447,6 +1475,8 @@ def _finish_assembly(state: AssemblyState, config: Config):
         shutil.copy(tmp_decrypted, dest_path)
 
         _ok(f"File saved: {dest_path}")
+        if on_success is not None:
+            on_success()
         _warn(
             "Warning: this file is stored unencrypted on disk. "
             "Move it to a safe place and don't leave it exposed for long."
